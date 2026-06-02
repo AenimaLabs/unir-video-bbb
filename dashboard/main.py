@@ -115,18 +115,23 @@ def update_progress(class_id: str, status: str, progress: int, error: Optional[s
         logger.info(f"[{class_id}] {status} {progress}%")
 
 
-def get_raw_url_patterns(server: str, recording_id: str) -> list[dict[str, str]]:
-    bases = [
-        f"https://{server}/presentation/{recording_id}/video",
-        f"https://{server}/presentation/{recording_id}",
-        f"https://{server}/playback/presentation/2.3/{recording_id}",
-        f"https://{server}/playback/presentation/2.0/{recording_id}",
-        f"https://{server}/playback/presentation/{recording_id}",
-    ]
-    return [
-        {"deskshare": f"{b}/deskshare.webm", "webcams": f"{b}/webcams.webm"}
-        for b in dict.fromkeys(bases)
-    ]
+def get_raw_url_patterns(server: str, recording_id: str) -> dict[str, list[str]]:
+    return {
+        "deskshare": [
+            f"https://{server}/presentation/{recording_id}/deskshare/deskshare.webm",
+            f"https://{server}/presentation/{recording_id}/deskshare.webm",
+            f"https://{server}/playback/presentation/2.3/{recording_id}/deskshare.webm",
+            f"https://{server}/playback/presentation/2.0/{recording_id}/deskshare.webm",
+            f"https://{server}/playback/presentation/{recording_id}/deskshare.webm",
+        ],
+        "webcams": [
+            f"https://{server}/presentation/{recording_id}/video/webcams.webm",
+            f"https://{server}/presentation/{recording_id}/webcams.webm",
+            f"https://{server}/playback/presentation/2.3/{recording_id}/webcams.webm",
+            f"https://{server}/playback/presentation/2.0/{recording_id}/webcams.webm",
+            f"https://{server}/playback/presentation/{recording_id}/webcams.webm",
+        ],
+    }
 
 
 async def process_class(class_id: str):
@@ -161,35 +166,63 @@ async def process_class(class_id: str):
             async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
                 # Descargar deskshare (opcional)
                 deskshare_ok = False
-                for pattern in url_patterns:
+                for file_url in url_patterns["deskshare"]:
                     try:
-                        await download_file(client, pattern["deskshare"], deskshare_path)
+                        await download_file(client, file_url, deskshare_path)
                         deskshare_ok = True
                         break
                     except Exception as e:
-                        logger.warning(f"Fallo deskshare {pattern['deskshare']}: {e}")
+                        logger.warning(f"Fallo deskshare {file_url}: {e}")
 
                 # Descargar webcams (obligatorio)
                 webcams_ok = False
-                for pattern in url_patterns:
+                for file_url in url_patterns["webcams"]:
                     try:
-                        await download_file(client, pattern["webcams"], webcams_path)
+                        await download_file(client, file_url, webcams_path)
                         webcams_ok = True
                         break
                     except Exception as e:
-                        logger.warning(f"Fallo webcams {pattern['webcams']}: {e}")
+                        logger.warning(f"Fallo webcams {file_url}: {e}")
 
                 if not webcams_ok:
                     raise RuntimeError(f"No se pudo descargar webcams.webm para {sess_label}")
 
             update_progress(class_id, f"Fusionando {sess_label}...", 40 + int((idx / len(sessions)) * 30))
 
-            # Si deskshare no está disponible, usar solo webcams
+            # Si deskshare no está disponible, extraer solo audio del webcam
             if not deskshare_ok:
-                logger.info(f"No hay deskshare para {sess_label}, usando solo webcams")
-                shutil.copy2(webcams_path, merged_path)
+                logger.info(f"No hay deskshare para {sess_label}, extrayendo solo audio del webcam")
+                audio_path = session_dir / "audio_only.webm"
+                extract_args = [
+                    "-i", str(webcams_path),
+                    "-vn",
+                    "-c:a", "copy",
+                    str(audio_path),
+                ]
+                ret, _, err = await run_ffmpeg(extract_args, cwd=session_dir)
+                if ret != 0 or not audio_path.exists():
+                    raise RuntimeError(f"Error extrayendo audio de webcams: {err}")
+
+                # Crear video placeholder (frame negro + audio)
+                placeholder_args = [
+                    "-f", "lavfi",
+                    "-i", "color=c=black:s=1280x720:r=1",
+                    "-i", str(audio_path),
+                    "-shortest",
+                    "-c:v", "libvpx-vp9",
+                    "-cpu-used", "2",
+                    "-deadline", "realtime",
+                    "-c:a", "copy",
+                    str(merged_path),
+                ]
+                ret, _, err = await run_ffmpeg(placeholder_args, cwd=session_dir)
+                if ret != 0 or not merged_path.exists():
+                    # Fallback extremo: solo audio
+                    logger.warning(f"No se pudo crear placeholder, usando solo audio")
+                    shutil.copy2(audio_path, merged_path)
+
                 merged_files.append(merged_path)
-                continue  # saltar merge, ir a la siguiente sesión
+                continue  # saltar merge estándar
 
             if not deskshare_path.exists() or not webcams_path.exists():
                 raise RuntimeError(f"Archivos no encontrados para {sess_label}")
